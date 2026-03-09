@@ -87,6 +87,20 @@ def build_logger() -> logging.Logger:
     return logger
 
 
+class PrefixedLoggerAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        prefix = str(self.extra.get("prefix") or "").strip()
+        if not prefix:
+            return msg, kwargs
+        return f"[{prefix}] {msg}", kwargs
+
+
+def build_task_logger(task_id: int, total_count: int) -> logging.LoggerAdapter:
+    width = max(2, len(str(max(total_count, 1))))
+    prefix = f"task-{task_id:0{width}d}/{total_count}"
+    return PrefixedLoggerAdapter(build_logger(), {"prefix": prefix})
+
+
 def random_string(length: int, alphabet: str) -> str:
     return "".join(random.choice(alphabet) for _ in range(length))
 

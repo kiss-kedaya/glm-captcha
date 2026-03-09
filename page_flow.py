@@ -1,19 +1,22 @@
 """页面流程：打开认证页、切换注册、填写资料、触发验证码、提交账号。"""
 from __future__ import annotations
 
+import time
 from typing import Any
 from typing import Optional
 
 from playwright.sync_api import Frame, Locator, Page
 
 from slider_captcha_solver import SliderCaptchaSolver
-from utils import RegisterProfile, sleep_random
+from utils import RegisterProfile
 
 PAGE_NAVIGATION_TIMEOUT_MS = 120_000
+PAGE_READY_TIMEOUT_MS = 15_000
 ELEMENT_ACTION_TIMEOUT_MS = 10_000
 ELEMENT_VISIBLE_TIMEOUT_MS = 1_500
-REGISTER_SWITCH_RETRY_COUNT = 3
-REGISTER_SWITCH_WAIT_MS = 2_500
+REGISTER_SWITCH_RETRY_COUNT = 4
+REGISTER_SWITCH_WAIT_MS = 500
+REGISTER_PRECLICK_SETTLE_MS = 120
 VERIFY_FAILED_TOAST_WAIT_MS = 4_000
 SIGNUP_RESPONSE_TIMEOUT_MS = 20_000
 REGISTER_PAGE_MARKER = "已经拥有账号了？"
@@ -60,6 +63,18 @@ CREATE_ACCOUNT_BUTTON_SELECTORS = [
     "button[type='submit']:has-text('创建账号')",
     "button.ButtonCreateAccount:has-text('创建账号')",
 ]
+AUTH_PAGE_READY_SELECTORS = [
+    "#aliyunCaptcha-captcha-text",
+    "input[autocomplete='email']",
+    "input[type='password']",
+    f"button:has-text('{REGISTER_BUTTON_TEXT}')",
+]
+VERIFY_PAGE_READY_SELECTORS = [
+    VERIFY_USERNAME_SELECTOR,
+    VERIFY_EMAIL_SELECTOR,
+    VERIFY_PASSWORD_SELECTOR,
+    f"button:has-text('{COMPLETE_REGISTER_BUTTON_TEXT}')",
+]
 
 
 class AuthPageFlow:
@@ -68,10 +83,25 @@ class AuthPageFlow:
         self.logger = logger
         self.slider_solver = SliderCaptchaSolver(page, logger)
 
+    def _wait_any_visible(self, selectors: list[str], timeout_ms: int) -> Locator:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            for selector in selectors:
+                locator = self.page.locator(selector).first
+                try:
+                    if locator.is_visible(timeout=200):
+                        return locator
+                except Exception:
+                    continue
+            self.page.wait_for_timeout(120)
+        raise RuntimeError(f"页面关键元素未在 {timeout_ms}ms 内就绪: {selectors}")
+
     def open(self, url: str = "https://chat.z.ai/auth") -> None:
+        started = time.perf_counter()
         self.page.goto(url, wait_until="domcontentloaded", timeout=PAGE_NAVIGATION_TIMEOUT_MS)
-        self.page.wait_for_load_state("networkidle", timeout=PAGE_NAVIGATION_TIMEOUT_MS)
-        self.logger.info("已打开页面: %s", self.page.url)
+        self._wait_any_visible(AUTH_PAGE_READY_SELECTORS, PAGE_READY_TIMEOUT_MS)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.logger.info("已打开页面: %s（耗时 %sms）", self.page.url, elapsed_ms)
 
     def _wait_register_form_ready(self, timeout_ms: int) -> bool:
         try:
@@ -108,12 +138,13 @@ class AuthPageFlow:
         for attempt in range(1, REGISTER_SWITCH_RETRY_COUNT + 1):
             register = self._register_switch_button()
             register.wait_for(state="visible", timeout=ELEMENT_ACTION_TIMEOUT_MS)
+            if attempt == 1:
+                self.page.wait_for_timeout(REGISTER_PRECLICK_SETTLE_MS)
             try:
                 register.click(timeout=ELEMENT_ACTION_TIMEOUT_MS)
             except Exception:
                 register.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, force=True)
             if self._wait_register_form_ready(timeout_ms=REGISTER_SWITCH_WAIT_MS):
-                sleep_random()
                 self.logger.info("已点击注册按钮，并进入注册表单（第%s次尝试）", attempt)
                 return
         raise RuntimeError("点击注册后未进入注册表单")
@@ -135,15 +166,12 @@ class AuthPageFlow:
         if name_input is not None:
             name_input.fill(profile.name)
             self.logger.info("已填写名称")
-            sleep_random()
         else:
             self.logger.warning("未找到名称输入框，页面可能仍处于登录态")
         if email is None or password is None:
             raise RuntimeError("未找到邮箱或密码输入框")
         email.fill(profile.email)
-        sleep_random()
         password.fill(profile.password)
-        sleep_random()
         self.logger.info("已填写邮箱与密码")
 
     def click_start_verify(self) -> None:
@@ -257,9 +285,11 @@ class AuthPageFlow:
         return False, f"signup 返回非 JSON 对象: {payload}"
 
     def open_verify_link(self, verify_link: str) -> None:
+        started = time.perf_counter()
         self.page.goto(verify_link, wait_until="domcontentloaded", timeout=PAGE_NAVIGATION_TIMEOUT_MS)
-        self.page.wait_for_load_state("networkidle", timeout=PAGE_NAVIGATION_TIMEOUT_MS)
-        self.logger.info("已打开邮箱验证链接")
+        self._wait_any_visible(VERIFY_PAGE_READY_SELECTORS, PAGE_READY_TIMEOUT_MS)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.logger.info("已打开邮箱验证链接（耗时 %sms）", elapsed_ms)
 
     def complete_register_after_verify(self, profile: RegisterProfile) -> None:
         username_input = self.page.locator(VERIFY_USERNAME_SELECTOR).first
@@ -281,9 +311,7 @@ class AuthPageFlow:
         password_input.wait_for(state="visible", timeout=ELEMENT_ACTION_TIMEOUT_MS)
         confirm_password_input.wait_for(state="visible", timeout=ELEMENT_ACTION_TIMEOUT_MS)
         password_input.fill(profile.password)
-        sleep_random()
         confirm_password_input.fill(profile.password)
-        sleep_random()
         complete_button.wait_for(state="visible", timeout=ELEMENT_ACTION_TIMEOUT_MS)
         complete_button.click(timeout=ELEMENT_ACTION_TIMEOUT_MS)
         self.logger.info("已点击完成注册按钮")
