@@ -1,13 +1,9 @@
 """页面流程：打开认证页、切换注册、填写资料、触发验证码、提交账号。"""
 from __future__ import annotations
-
 import time
-from typing import Any
-from typing import Optional
-
+from typing import Any, Optional
 from playwright.sync_api import Frame, Locator, Page
-
-from slider_captcha_solver import SliderCaptchaSolver
+from slider_verifier import SliderVerifier
 from utils import RegisterProfile
 
 PAGE_NAVIGATION_TIMEOUT_MS = 120_000
@@ -17,6 +13,8 @@ ELEMENT_VISIBLE_TIMEOUT_MS = 1_500
 REGISTER_SWITCH_RETRY_COUNT = 4
 REGISTER_SWITCH_WAIT_MS = 500
 REGISTER_PRECLICK_SETTLE_MS = 120
+START_VERIFY_PRECLICK_SETTLE_MS = 350
+START_VERIFY_CLICK_DELAY_MS = 160
 VERIFY_FAILED_TOAST_WAIT_MS = 4_000
 SIGNUP_RESPONSE_TIMEOUT_MS = 20_000
 REGISTER_PAGE_MARKER = "已经拥有账号了？"
@@ -27,7 +25,6 @@ SIGNUP_API_PATH = "/api/v1/auths/signup"
 CAPTCHA_POPUP_SELECTOR = "#aliyunCaptcha-window-float"
 SLIDER_RESULT_SELECTOR = "#aliyunCaptcha-sliding-text"
 SLIDER_FAIL_CLASS = "fail"
-
 REGISTER_BUTTON_TEXT = "注册"
 LOGIN_BUTTON_TEXT = "登录"
 CREATE_ACCOUNT_BUTTON_TEXT = "创建账号"
@@ -36,7 +33,6 @@ VERIFY_USERNAME_SELECTOR = "#username"
 VERIFY_EMAIL_SELECTOR = "#email"
 VERIFY_PASSWORD_SELECTOR = "#password"
 VERIFY_CONFIRM_PASSWORD_SELECTOR = "#confirmPassword"
-
 NAME_SELECTORS = [
     "input[autocomplete='name']",
     "input[placeholder='输入您的名称']",
@@ -75,13 +71,11 @@ VERIFY_PAGE_READY_SELECTORS = [
     VERIFY_PASSWORD_SELECTOR,
     f"button:has-text('{COMPLETE_REGISTER_BUTTON_TEXT}')",
 ]
-
-
 class AuthPageFlow:
-    def __init__(self, page: Page, logger) -> None:
+    def __init__(self, page: Page, logger, slider_verifier: SliderVerifier) -> None:
         self.page = page
         self.logger = logger
-        self.slider_solver = SliderCaptchaSolver(page, logger)
+        self.slider_verifier = slider_verifier
 
     def _wait_any_visible(self, selectors: list[str], timeout_ms: int) -> Locator:
         deadline = time.time() + (timeout_ms / 1000)
@@ -194,16 +188,20 @@ class AuthPageFlow:
                 pass
             raise RuntimeError("未找到“点击开始验证”入口，当前页面状态不在可触发验证阶段") from exc
         try:
-            trigger.click(timeout=ELEMENT_ACTION_TIMEOUT_MS)
+            self.page.wait_for_timeout(START_VERIFY_PRECLICK_SETTLE_MS)
+            trigger.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, delay=START_VERIFY_CLICK_DELAY_MS)
         except Exception:
-            self.page.evaluate(
-                """(selector) => {
-                    const element = document.querySelector(selector);
-                    if (!element) throw new Error("未找到验证码触发元素");
-                    element.click();
-                }""",
-                "#aliyunCaptcha-captcha-text",
-            )
+            try:
+                trigger.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, force=True, delay=START_VERIFY_CLICK_DELAY_MS)
+            except Exception:
+                self.page.evaluate(
+                    """(selector) => {
+                        const element = document.querySelector(selector);
+                        if (!element) throw new Error("未找到验证码触发元素");
+                        element.click();
+                    }""",
+                    "#aliyunCaptcha-captcha-text",
+                )
         self.logger.info("已点击开始验证")
 
     def has_verify_failed_toast(self, timeout_ms: int = VERIFY_FAILED_TOAST_WAIT_MS) -> bool:
@@ -237,7 +235,7 @@ class AuthPageFlow:
             return False
 
     def solve_slider_captcha(self) -> int:
-        slider_distance = self.slider_solver.solve()
+        slider_distance = self.slider_verifier.solve()
         self.logger.info("滑块验证流程执行完成，推荐距离: %spx", slider_distance)
         return slider_distance
 
@@ -283,14 +281,12 @@ class AuthPageFlow:
             message = payload.get("message") or payload.get("error") or str(payload)
             return False, str(message)
         return False, f"signup 返回非 JSON 对象: {payload}"
-
     def open_verify_link(self, verify_link: str) -> None:
         started = time.perf_counter()
         self.page.goto(verify_link, wait_until="domcontentloaded", timeout=PAGE_NAVIGATION_TIMEOUT_MS)
         self._wait_any_visible(VERIFY_PAGE_READY_SELECTORS, PAGE_READY_TIMEOUT_MS)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.logger.info("已打开邮箱验证链接（耗时 %sms）", elapsed_ms)
-
     def complete_register_after_verify(self, profile: RegisterProfile) -> None:
         username_input = self.page.locator(VERIFY_USERNAME_SELECTOR).first
         email_input = self.page.locator(VERIFY_EMAIL_SELECTOR).first

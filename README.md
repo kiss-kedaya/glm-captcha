@@ -20,6 +20,7 @@
 - 支持单账号注册
 - 支持批量并发注册多个账号
 - 支持 `mail.tm` 和 `duckmail` 两种临时邮箱提供商
+- 支持滑块 `auto` 自动模式和 `manual` 手动验证模式
 - 支持独立滑块压测脚本 `verify_slider.py`
 - 支持结构化 JSONL 日志与失败样本采集
 - 优先使用本机 `msedge` / `chrome` 浏览器通道，失败时回退到 Playwright Chromium
@@ -135,6 +136,14 @@ python main.py
 .venv\Scripts\python.exe main.py --headless
 ```
 
+### 手动滑块模式
+
+```powershell
+.venv\Scripts\python.exe main.py --slider-mode manual
+```
+
+`manual` 模式要求可见浏览器，不支持 `--headless`，并且不支持并发大于 `1`。
+
 ### 指定目标地址
 
 ```powershell
@@ -148,6 +157,7 @@ python main.py
 - `--count`: 需要注册的总账号数
 - `--concurrency`: 同时运行的并发任务数
 - `--headless`: 是否无头运行
+- `--slider-mode`: `auto` 自动滑块，`manual` 手动拖动滑块
 - `--summary-path`: 批量汇总 JSON 输出路径
 
 ### 示例 1：并发 2 个，总共注册 2 个账号
@@ -213,6 +223,12 @@ output/debug/batch_run_<timestamp>.json
 .venv\Scripts\python.exe verify_slider.py --attempts 3 --sample-artifacts all
 ```
 
+### 手动拖动滑块
+
+```powershell
+.venv\Scripts\python.exe verify_slider.py --slider-mode manual
+```
+
 ### 常用参数
 
 | 参数 | 说明 |
@@ -222,6 +238,7 @@ output/debug/batch_run_<timestamp>.json
 | `--pause-ms` | 每次尝试结束前停留时间 |
 | `--timeout-ms` | 页面加载与等待超时 |
 | `--save-success-screenshot` | 成功时也保存截图 |
+| `--slider-mode` | `auto` 自动识别拖动，`manual` 手动完成验证 |
 | `--structured-log` | JSONL 结构化日志路径 |
 | `--sample-dir` | 样本根目录 |
 | `--sample-artifacts` | 样本保留策略：`off` / `failure` / `all` |
@@ -249,6 +266,9 @@ output/debug/batch_run_<timestamp>.json
 - `captcha_images_extracted`
 - `ocr_match_computed`
 - `drag_completed`
+- `manual_verification_started`
+- `manual_verification_failed`
+- `manual_verification_succeeded`
 - `slider_result_success`
 - `slider_result_failed`
 
@@ -344,6 +364,16 @@ output/debug/batch_run_<timestamp>.json
 ### 4. 为什么推荐先不开 headless
 
 因为验证码调试阶段最重要的是观察页面状态、重试节奏和失败反馈。先用有头模式确认链路稳定，再切换到 `--headless` 更稳妥。
+
+### 5. 想自己拖动滑块，但保留后续自动注册流程
+
+可以直接运行：
+
+```powershell
+.venv\Scripts\python.exe main.py --slider-mode manual
+```
+
+程序会在浏览器里等待你手动完成滑块，验证通过后继续自动提交注册、轮询邮箱并提取 token。
 
 ## 开发建议
 
