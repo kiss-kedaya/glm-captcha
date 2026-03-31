@@ -17,13 +17,23 @@ START_VERIFY_PRECLICK_SETTLE_MS = 350
 START_VERIFY_CLICK_DELAY_MS = 160
 VERIFY_FAILED_TOAST_WAIT_MS = 4_000
 SIGNUP_RESPONSE_TIMEOUT_MS = 20_000
+CAPTCHA_RENDER_TIMEOUT_MS = 15_000
+CAPTCHA_RENDER_POLL_MS = 200
 REGISTER_PAGE_MARKER = "已经拥有账号了？"
 LOGIN_PAGE_MARKER = "没有账号？"
 VERIFY_FAILED_TEXT = "验证失败，请重试"
 VERIFY_FAILED_TOAST_SELECTOR = "li[data-sonner-toast][data-type='error'] div[data-title]"
 SIGNUP_API_PATH = "/api/v1/auths/signup"
-CAPTCHA_POPUP_SELECTOR = "#aliyunCaptcha-window-float"
-SLIDER_RESULT_SELECTOR = "#aliyunCaptcha-sliding-text"
+CAPTCHA_POPUP_SELECTOR = "#aliyunCaptcha-window-float, #aliyunCaptcha-window-embed"
+CAPTCHA_TRIGGER_SELECTORS = [
+    "#aliyunCaptcha-captcha-text",
+    "#aliyunCaptcha-captcha-text-box",
+    "#aliyunCaptcha-captcha-body",
+    "#captcha-element #aliyunCaptcha-captcha-text-box",
+    "#captcha-element #aliyunCaptcha-captcha-body",
+    "#captcha-element",
+]
+SLIDER_RESULT_SELECTOR = "#aliyunCaptcha-sliding-text, #aliyunCaptcha-sliding-text-box"
 SLIDER_FAIL_CLASS = "fail"
 REGISTER_BUTTON_TEXT = "注册"
 LOGIN_BUTTON_TEXT = "登录"
@@ -61,9 +71,11 @@ CREATE_ACCOUNT_BUTTON_SELECTORS = [
 ]
 AUTH_PAGE_READY_SELECTORS = [
     "#aliyunCaptcha-captcha-text",
+    "#captcha-element",
     "input[autocomplete='email']",
     "input[type='password']",
     f"button:has-text('{REGISTER_BUTTON_TEXT}')",
+    f"button:has-text('{LOGIN_BUTTON_TEXT}')",
 ]
 VERIFY_PAGE_READY_SELECTORS = [
     VERIFY_USERNAME_SELECTOR,
@@ -90,10 +102,20 @@ class AuthPageFlow:
             self.page.wait_for_timeout(120)
         raise RuntimeError(f"页面关键元素未在 {timeout_ms}ms 内就绪: {selectors}")
 
-    def open(self, url: str = "https://chat.z.ai/auth") -> None:
+    def open(self, url: str = "https://chat.z.ai/auth?action=signup&redirect_uri=https%3A%2F%2Fz.ai%2F") -> None:
         started = time.perf_counter()
         self.page.goto(url, wait_until="domcontentloaded", timeout=PAGE_NAVIGATION_TIMEOUT_MS)
-        self._wait_any_visible(AUTH_PAGE_READY_SELECTORS, PAGE_READY_TIMEOUT_MS)
+        try:
+            self._wait_any_visible(AUTH_PAGE_READY_SELECTORS, PAGE_READY_TIMEOUT_MS)
+        except Exception:
+            self.page.wait_for_function(
+                """({ registerText, loginText }) => {
+                    const text = document.body?.innerText || '';
+                    return text.includes(registerText) || text.includes(loginText);
+                }""",
+                arg={"registerText": REGISTER_BUTTON_TEXT, "loginText": LOGIN_BUTTON_TEXT},
+                timeout=PAGE_READY_TIMEOUT_MS,
+            )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         self.logger.info("已打开页面: %s（耗时 %sms）", self.page.url, elapsed_ms)
 
@@ -115,33 +137,57 @@ class AuthPageFlow:
             return False
 
     def _register_switch_button(self) -> Locator:
-        footer_register = self.page.locator(
-            f"div:has-text('{LOGIN_PAGE_MARKER}') button[type='button']:has-text('{REGISTER_BUTTON_TEXT}')"
-        ).first
-        try:
-            if footer_register.is_visible(timeout=ELEMENT_VISIBLE_TIMEOUT_MS):
-                return footer_register
-        except Exception:
-            pass
-        return self.page.get_by_role("button", name=REGISTER_BUTTON_TEXT).first
+        candidates = [
+            self.page.locator(
+                f"div:has-text('{LOGIN_PAGE_MARKER}') button[type='button']:has-text('{REGISTER_BUTTON_TEXT}')"
+            ).first,
+            self.page.locator(f"button:has-text('{REGISTER_BUTTON_TEXT}')").first,
+            self.page.locator(f"text='{REGISTER_BUTTON_TEXT}'").first,
+            self.page.get_by_role("button", name=REGISTER_BUTTON_TEXT).first,
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.is_visible(timeout=ELEMENT_VISIBLE_TIMEOUT_MS):
+                    return candidate
+            except Exception:
+                continue
+        return candidates[0]
 
     def click_register(self) -> None:
         if self._wait_register_form_ready(timeout_ms=500):
             self.logger.info("已处于注册表单状态，跳过注册按钮点击")
             return
+        last_error = ''
         for attempt in range(1, REGISTER_SWITCH_RETRY_COUNT + 1):
             register = self._register_switch_button()
-            register.wait_for(state="visible", timeout=ELEMENT_ACTION_TIMEOUT_MS)
             if attempt == 1:
                 self.page.wait_for_timeout(REGISTER_PRECLICK_SETTLE_MS)
+            clicked = False
             try:
-                register.click(timeout=ELEMENT_ACTION_TIMEOUT_MS)
-            except Exception:
-                register.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, force=True)
+                if register.is_visible(timeout=ELEMENT_VISIBLE_TIMEOUT_MS):
+                    register.click(timeout=ELEMENT_ACTION_TIMEOUT_MS)
+                    clicked = True
+            except Exception as exc:
+                last_error = str(exc)
+            if not clicked:
+                try:
+                    clicked = self.page.evaluate(
+                        """(registerText) => {
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            const target = buttons.find((node) => (node.textContent || '').includes(registerText));
+                            if (!target) return false;
+                            target.click();
+                            return true;
+                        }""",
+                        REGISTER_BUTTON_TEXT,
+                    )
+                except Exception as exc:
+                    last_error = str(exc)
             if self._wait_register_form_ready(timeout_ms=REGISTER_SWITCH_WAIT_MS):
                 self.logger.info("已点击注册按钮，并进入注册表单（第%s次尝试）", attempt)
                 return
-        raise RuntimeError("点击注册后未进入注册表单")
+            self.page.wait_for_timeout(REGISTER_SWITCH_WAIT_MS)
+        raise RuntimeError(f"点击注册后未进入注册表单: {last_error}")
 
     def _first_visible(self, scope: Page | Frame, selectors: list[str]) -> Optional[Locator]:
         for selector in selectors:
@@ -168,41 +214,68 @@ class AuthPageFlow:
         password.fill(profile.password)
         self.logger.info("已填写邮箱与密码")
 
+    def wait_for_captcha_ready(self, timeout_ms: int = CAPTCHA_RENDER_TIMEOUT_MS) -> Locator:
+        deadline = time.time() + (timeout_ms / 1000)
+        last_state: dict[str, Any] | None = None
+        while time.time() < deadline:
+            popup = self.page.locator(CAPTCHA_POPUP_SELECTOR).first
+            try:
+                if popup.is_visible(timeout=200):
+                    self.logger.info("验证码窗口已可见，直接进入验证")
+                    return popup
+            except Exception:
+                pass
+            trigger = self._first_visible(self.page, CAPTCHA_TRIGGER_SELECTORS)
+            if trigger is not None:
+                self.logger.info("验证码入口已挂载")
+                return trigger
+            last_state = self.page.evaluate(
+                """() => ({
+                    hasCaptchaElement: Boolean(document.querySelector('#captcha-element')),
+                    hasOldTrigger: Boolean(document.querySelector('#aliyunCaptcha-captcha-text')),
+                    hasNewTrigger: Boolean(document.querySelector('#aliyunCaptcha-captcha-text-box')),
+                    hasCaptchaBody: Boolean(document.querySelector('#aliyunCaptcha-captcha-body')),
+                    hasFloatPopup: Boolean(document.querySelector('#aliyunCaptcha-window-float')),
+                    hasEmbedPopup: Boolean(document.querySelector('#aliyunCaptcha-window-embed')),
+                    captchaElementHtml: document.querySelector('#captcha-element')?.outerHTML?.slice(0, 400) || '',
+                    bodyClass: document.querySelector('#aliyunCaptcha-captcha-body')?.className || '',
+                    textBoxClass: document.querySelector('#aliyunCaptcha-captcha-text-box')?.className || '',
+                })"""
+            )
+            self.page.wait_for_timeout(CAPTCHA_RENDER_POLL_MS)
+        raise RuntimeError(f"等待验证码入口挂载超时，当前状态: {last_state}")
+
     def click_start_verify(self) -> None:
+        target = self.wait_for_captcha_ready()
         popup = self.page.locator(CAPTCHA_POPUP_SELECTOR).first
         try:
             if popup.is_visible(timeout=ELEMENT_VISIBLE_TIMEOUT_MS):
-                self.logger.info("验证码浮层已在前台，直接进入重试验证")
+                self.logger.info("验证码窗口已可见，直接进入验证")
                 return
         except Exception:
             pass
-        trigger = self.page.locator("#aliyunCaptcha-captcha-text").first
-        try:
-            trigger.wait_for(state="visible", timeout=ELEMENT_ACTION_TIMEOUT_MS)
-        except Exception as exc:
-            try:
-                if popup.is_visible(timeout=ELEMENT_VISIBLE_TIMEOUT_MS):
-                    self.logger.info("验证码浮层已在前台，直接进入重试验证")
-                    return
-            except Exception:
-                pass
-            raise RuntimeError("未找到“点击开始验证”入口，当前页面状态不在可触发验证阶段") from exc
         try:
             self.page.wait_for_timeout(START_VERIFY_PRECLICK_SETTLE_MS)
-            trigger.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, delay=START_VERIFY_CLICK_DELAY_MS)
+            target.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, delay=START_VERIFY_CLICK_DELAY_MS)
         except Exception:
             try:
-                trigger.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, force=True, delay=START_VERIFY_CLICK_DELAY_MS)
+                target.click(timeout=ELEMENT_ACTION_TIMEOUT_MS, force=True, delay=START_VERIFY_CLICK_DELAY_MS)
             except Exception:
-                self.page.evaluate(
-                    """(selector) => {
-                        const element = document.querySelector(selector);
-                        if (!element) throw new Error("未找到验证码触发元素");
-                        element.click();
-                    }""",
-                    "#aliyunCaptcha-captcha-text",
-                )
-        self.logger.info("已点击开始验证")
+                for selector in CAPTCHA_TRIGGER_SELECTORS:
+                    clicked = self.page.evaluate(
+                        """(selector) => {
+                            const element = document.querySelector(selector);
+                            if (!element) return false;
+                            element.click();
+                            return true;
+                        }""",
+                        selector,
+                    )
+                    if clicked:
+                        break
+                else:
+                    raise RuntimeError("未找到可点击的验证码触发元素")
+        self.logger.info("已触发验证码入口")
 
     def has_verify_failed_toast(self, timeout_ms: int = VERIFY_FAILED_TOAST_WAIT_MS) -> bool:
         try:
@@ -248,6 +321,22 @@ class AuthPageFlow:
             button = fallback
         button.click(timeout=ELEMENT_ACTION_TIMEOUT_MS)
         self.logger.info("已点击创建账号按钮")
+
+    def trigger_signup_captcha(self, timeout_ms: int = CAPTCHA_RENDER_TIMEOUT_MS) -> None:
+        popup = self.page.locator(CAPTCHA_POPUP_SELECTOR).first
+        try:
+            if popup.is_visible(timeout=300):
+                self.logger.info("验证码浮层仍可见，沿用当前题目继续处理")
+                return
+        except Exception:
+            pass
+        trigger = self._first_visible(self.page, CAPTCHA_TRIGGER_SELECTORS)
+        if trigger is not None:
+            self.logger.info("验证码入口已存在，跳过重复点击创建账号")
+            return
+        self.click_create_account()
+        self.wait_for_captcha_ready(timeout_ms=timeout_ms)
+        self.logger.info("创建账号已触发验证码挂载")
 
     def _wait_signup_response_compat(self, timeout_ms: int):
         wait_for_response = getattr(self.page, "wait_for_response", None)

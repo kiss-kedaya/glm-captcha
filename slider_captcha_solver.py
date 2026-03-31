@@ -57,7 +57,7 @@ TARGET_SHADOW_MAX_BIAS_PX = 6
 SOLVER_MAX_INTERNAL_ATTEMPTS = 3
 SOLVER_RETRY_WAIT_MS = 1_200
 CAPTCHA_REFRESH_WAIT_MS = 900
-SLIDER_RESULT_SELECTOR = "#aliyunCaptcha-sliding-text"
+SLIDER_RESULT_SELECTOR = "#aliyunCaptcha-sliding-text, #aliyunCaptcha-sliding-text-box"
 SLIDER_RESULT_WAIT_MS = 6_000
 SLIDER_RESULT_POLL_MS = 200
 SLIDER_READY_TIMEOUT_MS = 8_000
@@ -76,7 +76,7 @@ RETRYABLE_SLIDER_ERROR_KEYWORDS = (
 )
 
 CAPTCHA_HINT_TEXT = "请完成安全验证"
-CAPTCHA_POPUP_SELECTOR = "#aliyunCaptcha-window-float"
+CAPTCHA_POPUP_SELECTOR = "#aliyunCaptcha-window-float, #aliyunCaptcha-window-embed"
 CAPTCHA_SLIDER_SELECTORS = ["#aliyunCaptcha-sliding-slider"]
 CAPTCHA_SLIDER_BODY_SELECTORS = ["#aliyunCaptcha-sliding-body"]
 CAPTCHA_SHADOW_SELECTORS = ["#aliyunCaptcha-puzzle"]
@@ -175,6 +175,22 @@ def calculate_shadow_match(shadow_url: str, background_url: str) -> CaptchaImage
     )
 
 
+def calculate_shadow_match_from_bytes(shadow_bytes: bytes, background_bytes: bytes) -> CaptchaImageMatch:
+    detector = _get_ocr_detector()
+    result = detector.slide_match(shadow_bytes, background_bytes)
+    target = result.get("target")
+    if not isinstance(target, list) or len(target) < 4:
+        raise RuntimeError(f"ddddocr 返回结果异常: {result}")
+    return CaptchaImageMatch(
+        target_left=int(target[0]),
+        target_top=int(target[1]),
+        target_right=int(target[2]),
+        target_bottom=int(target[3]),
+        target_x=int(result.get("target_x") or 0),
+        target_y=int(result.get("target_y") or 0),
+    )
+
+
 class SliderVerificationFailedError(RuntimeError):
     pass
 
@@ -242,6 +258,61 @@ class SliderCaptchaSolver:
             "source_kind": "data_url" if image_source.startswith(DATA_URL_PREFIX) else "remote_url",
         }
 
+    def _capture_image_artifact_from_dom(
+        self,
+        selector: str,
+        *,
+        image_source: str,
+        internal_attempt: int,
+        label: str,
+    ) -> dict[str, object]:
+        locator = self.page.locator(CAPTCHA_POPUP_SELECTOR).first.locator(selector).first
+        image_bytes = locator.screenshot(timeout=ELEMENT_ACTION_TIMEOUT_MS)
+        sha256 = hashlib.sha256(image_bytes).hexdigest()
+        saved_path: Optional[str] = None
+        if self.sample_dir is not None:
+            self.sample_dir.mkdir(parents=True, exist_ok=True)
+            file_path = self.sample_dir / f"challenge_{internal_attempt:02d}_{label}.png"
+            file_path.write_bytes(image_bytes)
+            saved_path = str(file_path)
+        return {
+            "label": label,
+            "path": saved_path,
+            "sha256": sha256,
+            "bytes": len(image_bytes),
+            "source_kind": "dom_screenshot" if not image_source.startswith(DATA_URL_PREFIX) else "data_url",
+        }
+
+    def _fetch_image_bytes_via_browser(self, image_source: str) -> bytes:
+        payload = self.page.evaluate(
+            """async (src) => {
+                if (!src) {
+                    throw new Error('empty image src');
+                }
+                if (src.startsWith('data:')) {
+                    return src;
+                }
+                const response = await fetch(src, { credentials: 'include' });
+                if (!response.ok) {
+                    throw new Error(`browser fetch failed: ${response.status}`);
+                }
+                const buffer = await response.arrayBuffer();
+                const bytes = new Uint8Array(buffer);
+                let binary = '';
+                const chunkSize = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    const chunk = bytes.subarray(i, i + chunkSize);
+                    binary += String.fromCharCode(...chunk);
+                }
+                const contentType = response.headers.get('content-type') || 'application/octet-stream';
+                return `data:${contentType};base64,${btoa(binary)}`;
+            }""",
+            image_source,
+        )
+        if not isinstance(payload, str) or not payload.startswith(DATA_URL_PREFIX):
+            raise RuntimeError(f"浏览器抓取图片失败，返回异常: {payload}")
+        return decode_data_url(payload)
+
     def _capture_challenge_artifacts(
         self,
         shadow_url: str,
@@ -249,16 +320,34 @@ class SliderCaptchaSolver:
         *,
         internal_attempt: int,
     ) -> None:
-        background = self._capture_image_artifact(
-            background_url,
-            internal_attempt=internal_attempt,
-            label="background",
-        )
-        shadow = self._capture_image_artifact(
-            shadow_url,
-            internal_attempt=internal_attempt,
-            label="shadow",
-        )
+        try:
+            background = self._capture_image_artifact(
+                background_url,
+                internal_attempt=internal_attempt,
+                label="background",
+            )
+        except Exception as exc:
+            self.logger.warning("背景图字节抓取失败，改用 DOM 截图落盘: %s", exc)
+            background = self._capture_image_artifact_from_dom(
+                CAPTCHA_BACKGROUND_SELECTORS[0],
+                image_source=background_url,
+                internal_attempt=internal_attempt,
+                label="background",
+            )
+        try:
+            shadow = self._capture_image_artifact(
+                shadow_url,
+                internal_attempt=internal_attempt,
+                label="shadow",
+            )
+        except Exception as exc:
+            self.logger.warning("阴影图字节抓取失败，改用 DOM 截图落盘: %s", exc)
+            shadow = self._capture_image_artifact_from_dom(
+                CAPTCHA_SHADOW_SELECTORS[0],
+                image_source=shadow_url,
+                internal_attempt=internal_attempt,
+                label="shadow",
+            )
         self._emit_event(
             "captcha_images_captured",
             internal_attempt=internal_attempt,
@@ -318,6 +407,34 @@ class SliderCaptchaSolver:
         if not background_url:
             raise RuntimeError("未获取到背景图片 URL")
         return shadow_url, background_url
+
+    def _read_image_bytes_with_fallback(self, selector: str, image_source: str) -> bytes:
+        try:
+            return fetch_image_bytes(image_source)
+        except Exception as exc:
+            self.logger.warning("图片字节直连失败，改用浏览器抓取: %s", exc)
+        try:
+            return self._fetch_image_bytes_via_browser(image_source)
+        except Exception as exc:
+            self.logger.warning("浏览器抓取图片失败，改用 DOM 截图: %s", exc)
+            locator = self.page.locator(CAPTCHA_POPUP_SELECTOR).first.locator(selector).first
+            return locator.screenshot(timeout=ELEMENT_ACTION_TIMEOUT_MS)
+
+    def _calculate_shadow_match_with_fallback(
+        self,
+        shadow_url: str,
+        background_url: str,
+    ) -> CaptchaImageMatch:
+        try:
+            return self.distance_calculator(shadow_url, background_url)
+        except Exception as exc:
+            self.logger.warning("远端图片匹配失败，改用 DOM 截图重新匹配: %s", exc)
+            shadow_bytes = self._read_image_bytes_with_fallback(CAPTCHA_SHADOW_SELECTORS[0], shadow_url)
+            background_bytes = self._read_image_bytes_with_fallback(CAPTCHA_BACKGROUND_SELECTORS[0], background_url)
+            try:
+                return calculate_shadow_match_from_bytes(shadow_bytes, background_bytes)
+            except Exception as fallback_exc:
+                raise SliderVerificationFailedError(f"截图匹配失败: {fallback_exc}") from fallback_exc
 
     def _refresh_captcha_challenge(self) -> None:
         popup = self.page.locator(CAPTCHA_POPUP_SELECTOR).first
@@ -607,7 +724,7 @@ class SliderCaptchaSolver:
                     background_url,
                     internal_attempt=attempt,
                 )
-                image_match = self.distance_calculator(shadow_url, background_url)
+                image_match = self._calculate_shadow_match_with_fallback(shadow_url, background_url)
                 state = self._read_captcha_state()
                 base_target_shadow_offset = self._calculate_target_shadow_offset(image_match, state)
                 target_shadow_offset = max(

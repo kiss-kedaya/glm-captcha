@@ -28,7 +28,7 @@ from utils import (
     save_account_token,
 )
 
-AUTH_URL = "https://chat.z.ai/auth"
+AUTH_URL = "https://chat.z.ai/auth?action=signup&redirect_uri=https%3A%2F%2Fz.ai%2F"
 VIEWPORT_WIDTH = 1440
 VIEWPORT_HEIGHT = 900
 POST_WAIT_MS = 5000
@@ -117,6 +117,7 @@ def _solve_signup_with_retries(flow: AuthPageFlow, page, submit_retry_count: int
     last_error = ""
     for attempt in range(1, submit_retry_count + 1):
         try:
+            flow.trigger_signup_captcha()
             flow.click_start_verify()
             slider_distance = flow.solve_slider_captcha()
         except SliderVerificationFailedError as exc:
